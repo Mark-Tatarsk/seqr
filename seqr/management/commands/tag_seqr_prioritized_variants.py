@@ -1,0 +1,704 @@
+from collections import defaultdict
+from datetime import datetime
+from django.contrib.postgres.aggregates import ArrayAgg
+from django.core.management.base import BaseCommand, CommandError
+from django.db.models import Q, F
+from django.db.models.functions import JSONObject
+
+from clickhouse_backend.models import ArrayField, StringField
+
+from clickhouse_search.backend.fields import NamedTupleField
+from clickhouse_search.backend.functions import ArrayFilter, ArrayMap
+from clickhouse_search.search import get_search_queryset, get_transcripts_queryset, add_individual_guids, \
+    get_data_type_comp_het_results_queryset, get_multi_data_type_comp_het_results_queryset, SELECTED_GENE_FIELD
+from panelapp.models import PaLocusListGene
+from reference_data.models import GENOME_VERSION_GRCh38
+from seqr.models import Project, Family, Individual, Sample, LocusList
+from seqr.utils.communication_utils import send_project_notification
+from seqr.utils.gene_utils import get_genes
+from seqr.utils.search.constants import ANY_AFFECTED, HOMOZYGOUS_RECESSIVE, X_LINKED_RECESSIVE_MALE_AFFECTED, DE_NOVO
+from seqr.utils.search.utils import clickhouse_only, get_search_samples, COMPOUND_HET
+from seqr.views.utils.orm_to_json_utils import SEQR_TAG_TYPE
+from seqr.views.utils.variant_utils import bulk_create_tagged_variants, gene_ids_annotated_queryset
+from settings import SEQR_SLACK_DATA_ALERTS_NOTIFICATION_CHANNEL
+
+import logging
+logger = logging.getLogger(__name__)
+
+
+GENE_LISTS = [
+    {'name': 'Mendeliome', 'confidences': ['AMBER', 'GREEN']},
+    {'name': 'Incidentalome', 'confidences': ['GREEN']}
+]
+
+EXCLUDE_GENE_IDS = [
+    'ENSG00000143631', 'ENSG00000165474', 'ENSG00000180210', 'ENSG00000198734', 'ENSG00000010704', 'ENSG00000132470',
+]
+
+ALL_SEARCHES_CRITERIA = {
+    'exclude': {'clinvar': ['likely_benign', 'benign']}
+}
+
+DOMINANT_MOI = 'D'
+RECESSIVE_MOI = 'R'
+MITO_MOI = 'M'
+
+MAX_AFFECTED_FAMILY_FILTER = 'max_affected'
+CONFIRMED_FAMILY_FILTER = 'confirmed_inheritance'
+AFFECTED_MALE_FAMILY_FILTER = 'affected_males'
+
+CLINVAR_FILTER = {
+    'clinvar': ['pathogenic', 'likely_pathogenic', 'conflicting_p_lp'],
+    'clinvarMinStars': 1,
+}
+
+NON_CODING_TRANSCRIPT_EXON_VARIANT = 'non_coding_transcript_exon_variant'
+HIGH_ANNOTATIONS= {
+    'vep_consequences': [
+        'splice_donor_variant',
+        'splice_acceptor_variant',
+        'stop_gained',
+        'frameshift_variant',
+    ],
+}
+MODERATE_ANNOTATIONS = {
+    'vep_consequences': [
+        'stop_lost',
+        'start_lost',
+        'inframe_insertion',
+        'inframe_deletion',
+        'protein_altering_variant',
+        'missense_variant',
+        'splice_donor_5th_base_variant',
+        'splice_region_variant',
+        'splice_donor_region_variant',
+        'splice_polypyrimidine_tract_variant',
+        'extended_intronic_splice_region_variant',
+    ]
+}
+HIGH_MODERATE_ANNOTATIONS = {
+    'vep_consequences': [
+        *HIGH_ANNOTATIONS['vep_consequences'],
+        *MODERATE_ANNOTATIONS['vep_consequences'],
+        NON_CODING_TRANSCRIPT_EXON_VARIANT,
+    ]
+}
+SV_ANNOTATIONS = {
+    'structural_consequence': ['LOF', 'INTRAGENIC_EXON_DUP'],
+}
+
+FREQ_FILTER = {
+    'callset': {'ac': 1000},
+    'gnomad_exomes': {'af': 0.01, 'hh': 5},
+    'gnomad_genomes': {'af': 0.01, 'hh': 5},
+    'sv_callset': {'ac': 500},
+    'gnomad_svs': {'af': 0.01},
+}
+
+IN_SILICO_FILTER = {
+    'cadd': 22,
+    'revel': 0.2
+}
+
+QUALITY_FILTER = {
+    'min_gq': 30,
+    'min_ab': 20
+}
+SV_QUALITY_FILTER = {
+    'min_gq_sv': 90,
+}
+PASS_QUALITY_FILTER = {
+    **QUALITY_FILTER,
+    **SV_QUALITY_FILTER,
+    'vcf_filter': 'PASS',
+}
+
+CONFIRMED_HIGH_SPLICE_AI_SEARCH = {
+    'family_filter': {
+        CONFIRMED_FAMILY_FILTER: True
+    },
+    'in_silico': {
+        'splice_ai': 0.5,
+        'requireScore': True
+    },
+}
+HIGH_SPLICE_AI_SEARCH = {
+    'family_filter': {
+        CONFIRMED_FAMILY_FILTER: False
+    },
+    'in_silico': {
+        'splice_ai': 0.8,
+        'requireScore': True
+    },
+}
+
+CLINVAR_RECESSIVE_SEARCH = {
+    'gene_list_moi': RECESSIVE_MOI,
+    'pathogenicity': CLINVAR_FILTER,
+    'freqs': {
+        'callset': {'ac': 2000},
+        'gnomad_exomes': {'af': 0.03},
+        'gnomad_genomes': {'af': 0.03}
+    },
+}
+
+RECESSIVE_SEARCH_NO_IN_SILICO = {
+    'gene_list_moi': RECESSIVE_MOI,
+    'freqs': FREQ_FILTER,
+    'qualityFilter': QUALITY_FILTER,
+}
+RECESSIVE_SEARCH = {
+    **RECESSIVE_SEARCH_NO_IN_SILICO,
+    'in_silico': IN_SILICO_FILTER,
+}
+SV_RECESSIVE_SEARCH = {
+    'gene_list_moi': RECESSIVE_MOI,
+    'annotations': SV_ANNOTATIONS,
+    'freqs': FREQ_FILTER,
+    'qualityFilter': SV_QUALITY_FILTER,
+}
+
+NO_PANEL_APP_DE_NOVO_SEARCH = {
+    'inheritance_mode': DE_NOVO,
+    'freqs': {
+        'callset': {'ac': 100},
+        'gnomad_exomes': {'ac': 100},
+        'gnomad_genomes': {'ac': 100},
+        'sv_callset': {'ac': 100},
+        'gnomad_svs': {'af': 0.001},
+    },
+    'qualityFilter': PASS_QUALITY_FILTER,
+}
+DE_NOVO_SEARCH = {
+    'gene_list_moi': DOMINANT_MOI,
+    **NO_PANEL_APP_DE_NOVO_SEARCH,
+}
+
+SEARCHES = {
+    'SNV_INDEL': {
+        'Clinvar Pathogenic': {
+            'gene_list_moi': DOMINANT_MOI,
+            'inheritance_mode': ANY_AFFECTED,
+            'pathogenicity': CLINVAR_FILTER,
+            'freqs': {
+                'callset': {'ac': 150},
+                'gnomad_exomes': {'ac': 150},
+                'gnomad_genomes': {'ac': 150},
+            },
+        },
+        'Clinvar Pathogenic - Compound Heterozygous': {
+            'inheritance_mode': COMPOUND_HET,
+            'split_pathogenicity_annotations': True,
+            'annotations': HIGH_MODERATE_ANNOTATIONS,
+            **CLINVAR_RECESSIVE_SEARCH,
+        },
+        'Clinvar Both Pathogenic - Compound Heterozygous': {
+            'inheritance_mode': COMPOUND_HET,
+            **CLINVAR_RECESSIVE_SEARCH,
+        },
+        'Clinvar Pathogenic - Recessive': {
+            'inheritance_mode': HOMOZYGOUS_RECESSIVE,
+            **CLINVAR_RECESSIVE_SEARCH,
+        },
+        'Clinvar Pathogenic - X-Linked Recessive': {
+            'inheritance_mode': X_LINKED_RECESSIVE_MALE_AFFECTED,
+            'family_filter': {
+                AFFECTED_MALE_FAMILY_FILTER: True
+            },
+            **CLINVAR_RECESSIVE_SEARCH,
+        },
+        'Compound Heterozygous': {
+            'inheritance_mode': COMPOUND_HET,
+            'annotations': {
+                'vep_consequences': [
+                    *HIGH_ANNOTATIONS['vep_consequences'],
+                    NON_CODING_TRANSCRIPT_EXON_VARIANT,
+                ],
+            },
+            'annotations_secondary': HIGH_MODERATE_ANNOTATIONS,
+            **RECESSIVE_SEARCH,
+        },
+        'Compound Heterozygous - Confirmed': {
+            'family_filter': {
+                MAX_AFFECTED_FAMILY_FILTER: 1,
+                CONFIRMED_FAMILY_FILTER: True
+            },
+            'inheritance_mode': COMPOUND_HET,
+            'annotations': MODERATE_ANNOTATIONS,
+            **RECESSIVE_SEARCH,
+        },
+        'Compound Heterozygous - Both High Splice AI': {
+            'inheritance_mode': COMPOUND_HET,
+            **HIGH_SPLICE_AI_SEARCH,
+            **RECESSIVE_SEARCH_NO_IN_SILICO,
+        },
+        'Compound Heterozygous - Both High Splice AI - Confirmed': {
+            'inheritance_mode': COMPOUND_HET,
+            **CONFIRMED_HIGH_SPLICE_AI_SEARCH,
+            **RECESSIVE_SEARCH_NO_IN_SILICO,
+        },
+        'Compound Heterozygous - High Splice AI': {
+            'family_filter': {
+                CONFIRMED_FAMILY_FILTER: False
+            },
+            'inheritance_mode': COMPOUND_HET,
+            'no_secondary_annotations': True,
+            'annotations': HIGH_MODERATE_ANNOTATIONS,
+            'annotations_secondary':{
+                'splice_ai': 0.8,
+            },
+            'in_silico': {
+                **IN_SILICO_FILTER,
+                'splice_ai': 0.8,
+            },
+            **RECESSIVE_SEARCH_NO_IN_SILICO,
+        },
+        'Compound Heterozygous - High Splice AI - Confirmed': {
+            'family_filter': {
+                CONFIRMED_FAMILY_FILTER: True
+            },
+            'inheritance_mode': COMPOUND_HET,
+            'no_secondary_annotations': True,
+            'annotations': HIGH_MODERATE_ANNOTATIONS,
+            'annotations_secondary':{
+                'splice_ai': 0.5,
+            },
+            'in_silico': {
+                **IN_SILICO_FILTER,
+                'splice_ai': 0.5,
+            },
+            **RECESSIVE_SEARCH_NO_IN_SILICO,
+        },
+        'De Novo': {
+            'family_filter': {
+                MAX_AFFECTED_FAMILY_FILTER: 1,
+                CONFIRMED_FAMILY_FILTER: True
+            },
+            'annotations': HIGH_MODERATE_ANNOTATIONS,
+            'require_any_gene': True,
+            'in_silico': IN_SILICO_FILTER,
+            **NO_PANEL_APP_DE_NOVO_SEARCH,
+        },
+        'De Novo/ Dominant': {
+            'family_filter': {
+                MAX_AFFECTED_FAMILY_FILTER: 1,
+                CONFIRMED_FAMILY_FILTER: False
+            },
+            'annotations': HIGH_ANNOTATIONS,
+            'in_silico': IN_SILICO_FILTER,
+            **DE_NOVO_SEARCH,
+        },
+        'Dominant': {
+            'family_filter': {
+                'min_affected': 2
+            },
+            'annotations': HIGH_MODERATE_ANNOTATIONS,
+            'in_silico': {
+                **IN_SILICO_FILTER,
+                'splice_ai': 0.5,
+            },
+            **DE_NOVO_SEARCH,
+        },
+        'High Splice AI - De Novo/ Dominant': {
+            **HIGH_SPLICE_AI_SEARCH,
+            **DE_NOVO_SEARCH,
+        },
+        'High Splice AI - De Novo': {
+            **CONFIRMED_HIGH_SPLICE_AI_SEARCH,
+            **DE_NOVO_SEARCH,
+        },
+        'High Splice AI - Recessive': {
+            'inheritance_mode': HOMOZYGOUS_RECESSIVE,
+            **HIGH_SPLICE_AI_SEARCH,
+            **RECESSIVE_SEARCH_NO_IN_SILICO,
+        },
+        'High Splice AI - Recessive Confirmed': {
+            'inheritance_mode': HOMOZYGOUS_RECESSIVE,
+            **CONFIRMED_HIGH_SPLICE_AI_SEARCH,
+            **RECESSIVE_SEARCH_NO_IN_SILICO,
+        },
+        'Recessive': {
+            'inheritance_mode': HOMOZYGOUS_RECESSIVE,
+            'annotations': HIGH_MODERATE_ANNOTATIONS,
+            **RECESSIVE_SEARCH,
+        },
+        'X-Linked Recessive': {
+            'inheritance_mode': X_LINKED_RECESSIVE_MALE_AFFECTED,
+            'family_filter': {
+                AFFECTED_MALE_FAMILY_FILTER: True
+            },
+            'annotations': HIGH_MODERATE_ANNOTATIONS,
+            **RECESSIVE_SEARCH,
+        },
+    },
+    'SV': {
+        'SV - Compound Heterozygous': {
+            'family_filter': {
+                CONFIRMED_FAMILY_FILTER: True
+            },
+            'inheritance_mode': COMPOUND_HET,
+            **SV_RECESSIVE_SEARCH,
+            'qualityFilter': PASS_QUALITY_FILTER,
+        },
+        'SV - De Novo/ Dominant': {
+            'family_filter': {
+                CONFIRMED_FAMILY_FILTER: True
+            },
+            'annotations': SV_ANNOTATIONS,
+            **DE_NOVO_SEARCH,
+        },
+        'SV - Recessive': {
+            'family_filter': {
+                CONFIRMED_FAMILY_FILTER: True
+            },
+            'inheritance_mode': HOMOZYGOUS_RECESSIVE,
+            **SV_RECESSIVE_SEARCH,
+        },
+        'SV - X-Linked Recessive': {
+            'inheritance_mode': X_LINKED_RECESSIVE_MALE_AFFECTED,
+            'family_filter': {
+                AFFECTED_MALE_FAMILY_FILTER: True,
+                CONFIRMED_FAMILY_FILTER: True,
+            },
+            **SV_RECESSIVE_SEARCH,
+        },
+    },
+    'MITO': {
+        'Mitochondrial - Pathogenic': {
+            'inheritance_mode': ANY_AFFECTED,
+            'pathogenicity': {'clinvar': CLINVAR_FILTER['clinvar']},
+            'annotations': {
+                'mitomap_pathogenic': True,
+            },
+            'freqs': {
+                'gnomad_mito': {'af': 0.05},
+            },
+        },
+        'Mitochondrial - De Novo/ Dominant': {
+            'gene_list_moi': MITO_MOI,
+            'inheritance_mode': DE_NOVO,
+            'annotations': HIGH_MODERATE_ANNOTATIONS,
+            'freqs': {
+                'gnomad_mito': {'af': 0.001},
+            },
+            'in_silico': {
+                'apogee': 0.5,
+                'hmtvar': 0.35,
+                'mlc': 0.75,
+            },
+            'qualityFilter': {
+                'min_hl': 5,
+                'min_mitoCn': 250,
+            },
+        },
+    },
+}
+
+MULTI_DATA_TYPE_SEARCHES = {
+    'Compound Heterozygous - One SV': {
+        'annotations': {
+            **SV_ANNOTATIONS,
+            **HIGH_MODERATE_ANNOTATIONS,
+        },
+        'in_silico': IN_SILICO_FILTER,
+        'freqs': FREQ_FILTER,
+        'qualityFilter': PASS_QUALITY_FILTER,
+    },
+}
+
+class Command(BaseCommand):
+    def add_arguments(self, parser):
+        parser.add_argument('project')
+
+    @clickhouse_only
+    def handle(self, *args, **options):
+        family_guid_map = {}
+        family_name_map = {}
+        project = Project.objects.get(guid=options['project'])
+        for db_id, guid, family_id in Family.objects.filter(project=project).values_list('id', 'guid', 'family_id'):
+            family_guid_map[guid] = db_id
+            family_name_map[db_id] = family_id
+
+        exclude_genes = get_genes(EXCLUDE_GENE_IDS, genome_version=GENOME_VERSION_GRCh38)
+        gene_by_moi = defaultdict(dict)
+        for gene_list in GENE_LISTS:
+            self._get_gene_list_genes(gene_list['name'], gene_list['confidences'], gene_by_moi, exclude_genes.keys())
+
+        family_variant_data = defaultdict(lambda: {'matched_searches': set(), 'matched_comp_het_searches': set(), 'support_vars': set()})
+        search_counts = {}
+        samples_by_dataset_type = {}
+        sample_qs = get_search_samples([project])
+        for dataset_type, searches in SEARCHES.items():
+            self._run_dataset_type_searches(
+                dataset_type, searches, sample_qs, family_variant_data, search_counts, samples_by_dataset_type, family_guid_map,
+                project, exclude_genes, gene_by_moi,
+            )
+
+        self._run_multi_data_type_comp_het_search(
+            family_variant_data, search_counts, samples_by_dataset_type, family_guid_map, project, sample_qs, genes=gene_by_moi[RECESSIVE_MOI],
+        )
+
+        today = datetime.now().strftime('%Y-%m-%d')
+        new_tag_keys, num_updated, num_skipped = bulk_create_tagged_variants(
+            family_variant_data, tag_name=SEQR_TAG_TYPE, get_metadata=self._get_metadata(today, 'matched_searches'),
+            get_comp_het_metadata=self._get_metadata(today, 'matched_comp_het_searches'), user=None, remove_missing_metadata=False,
+        )
+
+        family_variants = defaultdict(list)
+        for family_id, variant_id in family_variant_data.keys():
+            family_variants[family_id].append(variant_id)
+        logger.info(f'Tagged {len(new_tag_keys)} new and {num_updated} previously tagged variants in {len(family_variants)} families, found {num_skipped} unchanged tags:')
+        for search_name, count in search_counts.items():
+            logger.info(f'  {search_name}: {count} variants')
+        if not new_tag_keys:
+            return
+
+        family_new_counts = defaultdict(int)
+        for family_id, variant_id in new_tag_keys:
+            family_new_counts[family_id] += 1
+
+        send_project_notification(
+            project,
+            notification=f'{len(new_tag_keys)} new seqr prioritized variants',
+            subject='New prioritized variants tagged in seqr',
+            email_template='This is to notify you that {notification} have been tagged in seqr project {project_link}',
+            slack_channel=SEQR_SLACK_DATA_ALERTS_NOTIFICATION_CHANNEL,
+            slack_detail='\n'.join(sorted([
+                f'{family_name_map[family_id]}: {count} new tags' for family_id, count in family_new_counts.items()
+            ])),
+        )
+
+    @classmethod
+    def _run_dataset_type_searches(cls, dataset_type, searches, sample_qs, family_variant_data, search_counts, samples_by_dataset_type, family_guid_map, project, exclude_genes, gene_by_moi):
+        is_sv = dataset_type == Sample.DATASET_TYPE_SV_CALLS
+        sample_qs = sample_qs.filter(dataset_type=dataset_type)
+        if is_sv:
+            sample_qs = sample_qs.exclude(
+                individual__sv_flags__contains=['outlier_num._calls'], individual__affected=Individual.AFFECTED_STATUS_AFFECTED,
+            )
+        sample_types = list(sample_qs.values_list('sample_type', flat=True).distinct())
+        if len(sample_types) > 1:
+            raise CommandError('Variant prioritization not supported for projects with multiple sample types')
+        sample_type = sample_types[0]
+        if is_sv:
+            dataset_type = f'{dataset_type}_{sample_type}'
+        samples_by_family = {
+            agg['individual__family__guid']: agg for agg in sample_qs.values('individual__family__guid').annotate(
+                affecteds=ArrayAgg(
+                    JSONObject(maternal_guid='individual__mother__guid', paternal_guid='individual__father__guid', sex='individual__sex'),
+                    filter=Q(individual__affected=Individual.AFFECTED_STATUS_AFFECTED),
+                ),
+                unaffected_guids=ArrayAgg('individual__guid', filter=Q(individual__affected=Individual.AFFECTED_STATUS_UNAFFECTED)),
+            ).filter(affecteds__len__gt=0)
+        }
+        samples_by_dataset_type[dataset_type] = samples_by_family
+
+        logger.info(f'Searching for prioritized {dataset_type} variants in {len(samples_by_family)} families in project {project.name}')
+        for search_name, config_search in searches.items():
+            exclude_locations = not config_search.get('gene_list_moi')
+            search_genes = exclude_genes if exclude_locations else gene_by_moi[config_search['gene_list_moi']]
+            sample_data = cls._get_valid_family_sample_data(
+                project, sample_type, samples_by_family, config_search.get('family_filter'),
+            )
+            run_search_func = cls._run_comp_het_search if config_search['inheritance_mode'] == COMPOUND_HET else cls._run_search
+            num_results = run_search_func(
+                search_name, config_search, family_variant_data, family_guid_map, dataset_type, sample_data, sample_qs,
+                exclude_locations=exclude_locations, genes=search_genes, **config_search, **ALL_SEARCHES_CRITERIA,
+            )
+            logger.info(f'Found {num_results} variants for criteria: {search_name}')
+            search_counts[search_name] = num_results
+
+    @classmethod
+    def _get_valid_family_sample_data(cls, project, sample_type, samples_by_family, family_filter=None):
+        if family_filter:
+            samples_by_family = {
+                family_guid: sample_data for family_guid, sample_data in samples_by_family.items()
+                if cls._family_passes_filter(sample_data, family_filter)
+            }
+        return {
+            'project_guids': [project.guid],
+            'num_families': len(samples_by_family),
+            'num_unaffected': sum(len(s['unaffected_guids']) for s in samples_by_family.values()),
+            'sample_type_families': {sample_type: samples_by_family.keys()},
+        }
+
+    @staticmethod
+    def _family_passes_filter(sample_data, family_filter):
+        if family_filter.get('min_affected') and len(sample_data['affecteds']) < family_filter['min_affected']:
+            return False
+        if family_filter.get(MAX_AFFECTED_FAMILY_FILTER) and len(sample_data['affecteds']) > family_filter[MAX_AFFECTED_FAMILY_FILTER]:
+            return False
+        if family_filter.get(AFFECTED_MALE_FAMILY_FILTER) and all(s['sex'] not in Individual.MALE_SEXES for s in sample_data['affecteds']):
+            return False
+        if CONFIRMED_FAMILY_FILTER in family_filter:
+            proband = next((s for s in sample_data['affecteds'] if s['maternal_guid'] and s['paternal_guid']), None)
+            if not proband:
+                return False
+            is_confirmed = proband['maternal_guid'] in sample_data['unaffected_guids'] and proband['paternal_guid'] in sample_data['unaffected_guids']
+            return (not is_confirmed) if family_filter[CONFIRMED_FAMILY_FILTER] == False else is_confirmed
+        return True
+
+    @staticmethod
+    def _get_metadata(today, metadata_key):
+        def wrapped(v):
+            return {name: today for name in v[metadata_key]} if v[metadata_key] else None
+        return wrapped
+
+    @classmethod
+    def _run_search(cls, search_name, config_search, family_variant_data, family_guid_map, dataset_type, sample_data, samples, **kwargs):
+        variant_fields = ['pos', 'end'] if dataset_type.startswith('SV') else ['ref', 'alt']
+        variant_values = {'endChrom': F('end_chrom')} if dataset_type == 'SV_WGS' else {}
+
+        results_qs = get_search_queryset(GENOME_VERSION_GRCh38, dataset_type, sample_data, **kwargs)
+        genotype_overrides_expressions = results_qs.genotype_override_values(results_qs)
+        if genotype_overrides_expressions:
+            variant_values.update({k: genotype_overrides_expressions[k] for k in ['familyGenotypes', 'transcripts']})
+        else:
+            results_qs = gene_ids_annotated_queryset(results_qs)
+            variant_fields += ['familyGenotypes', 'gene_ids']
+
+        require_mane_consequences = config_search.get('annotations', {}).get('vep_consequences')
+        if require_mane_consequences:
+            variant_values['canonical_transcripts'] = cls._valid_field_transcripts_expression('sorted_transcript_consequences', 'canonical')
+
+        results = results_qs.values(
+            *variant_fields, 'key', 'xpos', 'variant_id', 'familyGuids', **variant_values,
+        )
+        add_individual_guids(results, samples, encode_genotypes_json=True)
+        if results and require_mane_consequences:
+            allowed_key_genes = cls._valid_gene_keys({v['key']: v['canonical_transcripts'] for v in results}, require_mane_consequences)
+            results = [r for r in results if r['key'] in allowed_key_genes]
+
+        for variant in results:
+            for family_guid in variant.pop('familyGuids'):
+                variant_data = family_variant_data[(family_guid_map[family_guid], variant['variant_id'])]
+                variant_data.update(variant)
+                variant_data['matched_searches'].add(search_name)
+
+        return len(results)
+
+    @classmethod
+    def _run_comp_het_search(cls, search_name, config_search, family_variant_data, family_guid_map, dataset_type, sample_data, samples, **kwargs):
+        queryset = get_data_type_comp_het_results_queryset(
+            GENOME_VERSION_GRCh38, dataset_type, sample_data, **kwargs,
+        )
+        return cls._execute_comp_het_search(
+            queryset, search_name, config_search, family_variant_data, family_guid_map, samples,
+            no_secondary_annotations=config_search.get('split_pathogenicity_annotations') or config_search.get('no_secondary_annotations'),
+        )
+
+    @classmethod
+    def _run_multi_data_type_comp_het_search(cls, family_variant_data, search_counts, samples_by_dataset_type, family_guid_map, project, samples, genes):
+        sv_dataset_type = next(dt for dt in samples_by_dataset_type.keys() if dt.startswith('SV'))
+        sample_type = sv_dataset_type.split('_')[-1]
+        families = set(samples_by_dataset_type[sv_dataset_type].keys()).intersection(samples_by_dataset_type[Sample.DATASET_TYPE_VARIANT_CALLS].keys())
+        sv_sample_data = cls._get_valid_family_sample_data(project, sample_type, {
+            guid: sample_data for guid, sample_data in samples_by_dataset_type[sv_dataset_type].items() if guid in families
+        })
+        snv_indel_sample_data = cls._get_valid_family_sample_data(project, sample_type, {
+            guid: sample_data for guid, sample_data in samples_by_dataset_type[Sample.DATASET_TYPE_VARIANT_CALLS].items() if guid in families
+        })
+        logger.info(f'Searching for prioritized multi data type variants in {len(families)} families in project {project.name}')
+        for search_name, config_search in MULTI_DATA_TYPE_SEARCHES.items():
+            queryset = get_multi_data_type_comp_het_results_queryset(
+                GENOME_VERSION_GRCh38, sv_dataset_type, sv_sample_data, snv_indel_sample_data, num_families=len(families),
+                genes=genes, **config_search, **ALL_SEARCHES_CRITERIA,
+            )
+            num_results = cls._execute_comp_het_search(queryset, search_name, config_search, family_variant_data, family_guid_map, samples)
+            logger.info(f'Found {num_results} variants for criteria: {search_name}')
+            search_counts[search_name] = num_results
+
+    @classmethod
+    def _execute_comp_het_search(cls, queryset, search_name, config_search, family_variant_data, family_guid_map, samples, no_secondary_annotations=True):
+        results = [list(v[1:]) for v in queryset]
+
+        primary_consequences = config_search.get('annotations', {}).get('vep_consequences')
+        secondary_consequences = config_search.get('annotations_secondary', {}).get('vep_consequences')
+        if results and (primary_consequences or secondary_consequences):
+            key_canonical_transcripts = {
+                v['key']: [t for t in v['sortedTranscriptConsequences'] if t['canonical']]
+                for pair in results for v in pair if v.get('sortedTranscriptConsequences')
+            }
+            allowed_key_genes = cls._valid_gene_keys(key_canonical_transcripts, primary_consequences)
+            if secondary_consequences:
+                allowed_secondary_key_genes = cls._valid_gene_keys(key_canonical_transcripts, secondary_consequences)
+            else:
+                allowed_secondary_key_genes = None if no_secondary_annotations else allowed_key_genes
+            results = [
+                pair for pair in results
+                if pair[0][SELECTED_GENE_FIELD] in allowed_key_genes.get(pair[0]['key'], []) and (
+                    allowed_secondary_key_genes is None or
+                    pair[1][SELECTED_GENE_FIELD] in allowed_secondary_key_genes.get(pair[1]['key'], [])
+                )
+            ]
+
+        add_individual_guids(results, samples, encode_genotypes_json=True)
+        for pair in results:
+            for family_guid in pair[0]['familyGuids']:
+                for variant, support_id in [(pair[0], pair[1]['variantId']), (pair[1], pair[0]['variantId'])]:
+                    variant_data = family_variant_data[(family_guid_map[family_guid], variant['variantId'])]
+                    variant_data.update(variant)
+                    if 'transcripts' not in variant_data:
+                        variant_data['gene_ids'] = list(dict.fromkeys([csq['geneId'] for csq in variant['sortedTranscriptConsequences']]))
+                    variant_data['support_vars'].add(support_id)
+                    variant_data['matched_comp_het_searches'].add(search_name)
+
+        return len(results)
+
+    @classmethod
+    def _valid_gene_keys(cls, key_canonical_transcripts, allowed_consequences):
+        keys = set(key_canonical_transcripts.keys())
+        mane_transcripts_by_key = get_transcripts_queryset(GENOME_VERSION_GRCh38, keys).values_list(
+            'key', cls._valid_field_transcripts_expression('transcripts', 'maneSelect'),
+        )
+        mane_transcript_genes = {
+            key: cls._valid_consequence_genes(mane_transcripts, allowed_consequences)
+            for key, mane_transcripts in mane_transcripts_by_key if mane_transcripts
+        }
+        missing_keys = keys - set(mane_transcript_genes.keys())
+        mane_transcript_genes.update({
+            key: cls._valid_consequence_genes(key_canonical_transcripts[key], allowed_consequences)
+            for key in missing_keys
+        })
+        return {key: genes for key, genes in mane_transcript_genes.items() if genes}
+
+    @staticmethod
+    def _valid_field_transcripts_expression(expression, field):
+        return ArrayMap(
+            ArrayFilter(expression, conditions=[{field: (None, 'isNotNull({field})')}]),
+            mapped_expression='tuple(x.consequenceTerms, x.geneId)',
+            output_field=ArrayField(
+                NamedTupleField([('consequenceTerms', ArrayField(StringField())), ('geneId', StringField())])),
+        )
+
+    @staticmethod
+    def _valid_consequence_genes(transcripts, allowed_consequences):
+        return {t['geneId'] for t in transcripts if set(allowed_consequences).intersection(t['consequenceTerms'])}
+
+    @staticmethod
+    def _get_gene_list_genes(name, confidences, gene_by_moi, exclude_gene_ids):
+        ll = LocusList.objects.get(name=name, palocuslist__isnull=False)
+        moi_gene_ids = ll.locuslistgene_set.exclude(gene_id__in=exclude_gene_ids).annotate(
+            is_dominant=Q(
+                Q(palocuslistgene__mode_of_inheritance__startswith='MONOALLELIC') &
+                ~Q(palocuslistgene__mode_of_inheritance__contains=' paternally imprinted') &
+                ~Q(palocuslistgene__mode_of_inheritance__contains=' maternally imprinted')
+            ),
+            is_recessive=Q(
+                palocuslistgene__mode_of_inheritance__startswith='BIALLELIC'
+            ) | Q(
+                palocuslistgene__mode_of_inheritance__startswith='X-LINKED',
+                palocuslistgene__mode_of_inheritance__contains='biallelic mutations',
+            ),
+            is_mito=Q(
+                palocuslistgene__mode_of_inheritance__startswith='MITOCHONDRIAL'
+            ),
+        ).filter(palocuslistgene__confidence_level__in=[
+            level for level, name in PaLocusListGene.CONFIDENCE_LEVEL_CHOICES if name in confidences
+        ]).values('gene_id', 'is_dominant', 'is_recessive', 'is_mito')
+
+        gene_id_mois = {g['gene_id']: g for g in moi_gene_ids}
+        genes_by_id = get_genes(gene_id_mois.keys(), genome_version=GENOME_VERSION_GRCh38, additional_model_fields=['id'])
+        gene_by_moi[DOMINANT_MOI].update({gene_id: gene for gene_id, gene in genes_by_id.items() if not gene_id_mois[gene_id]['is_recessive']})
+        gene_by_moi[RECESSIVE_MOI].update({gene_id: gene for gene_id, gene in genes_by_id.items() if not gene_id_mois[gene_id]['is_dominant']})
+        gene_by_moi[MITO_MOI].update({gene_id: gene for gene_id, gene in genes_by_id.items() if gene_id_mois[gene_id]['is_mito']})

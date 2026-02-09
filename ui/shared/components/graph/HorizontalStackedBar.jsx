@@ -1,0 +1,148 @@
+import React from 'react'
+import PropTypes from 'prop-types'
+import styled from 'styled-components'
+
+import { Popup, Table } from 'semantic-ui-react'
+import { Link } from 'react-router-dom'
+
+import { ColoredIcon, NoBorderTable } from '../StyledComponents'
+
+const BarContainer = styled.div.attrs(props => ({
+  w: props.width ? `${props.width}${typeof props.width === 'number' ? 'px' : ''}` : '100%',
+  h: props.height ? `${props.height}px` : 'auto',
+  lh: props.height ? `${props.height - 2}px` : 'inherit',
+}))`
+  display: inline-block;
+  width: ${props => props.w};
+  height: ${props => props.h};
+  line-height: ${props => props.lh};
+  text-align: center;
+  border: 1px solid gray;`
+
+const BarSection = styled(({ to, ...props }) => React.createElement(to ? Link : 'div', { to, ...props })).attrs(
+  props => ({ style: { width: `${props.percent}%` } }),
+)`  
+  display: inline-block;
+  height: 100%;
+  background-color: ${props => props.color};`
+
+const NoWrap = styled.span`
+  white-space: nowrap;`
+
+const TableRow = styled(Table.Row)`
+  padding: 0px !important;`
+
+const TableCell = styled(Table.Cell)`
+  padding: .2em .6em !important;`
+
+class HorizontalStackedBar extends React.PureComponent {
+
+  static propTypes = {
+    title: PropTypes.string.isRequired,
+    data: PropTypes.arrayOf(PropTypes.object), // an array of objects with keys: name, count, color, percent
+    dataCounts: PropTypes.object, // optional map of name to count to use instead fo data count
+    width: PropTypes.oneOfType([PropTypes.number, PropTypes.string]),
+    height: PropTypes.number,
+    linkPath: PropTypes.string,
+    minPercent: PropTypes.number,
+    noDataMessage: PropTypes.string,
+    showAllPopupCategories: PropTypes.bool,
+    showPercent: PropTypes.bool,
+    showTotal: PropTypes.bool,
+    sectionLinks: PropTypes.bool,
+    excludeItems: PropTypes.arrayOf(PropTypes.string),
+  }
+
+  render() {
+    const {
+      title, width, height, linkPath, sectionLinks, showAllPopupCategories, dataCounts, excludeItems,
+      minPercent = 1, noDataMessage = 'No Data', showPercent = true, showTotal = true,
+    } = this.props
+    let { data = [] } = this.props
+
+    if (excludeItems) {
+      data = data.filter(t => !excludeItems.includes(t.name))
+    }
+    data = data.map(({ count, ...item }) => ({ ...item, count: (dataCounts ? dataCounts[item.name] : count) || 0 }))
+
+    const total = data.reduce((acc, { count }) => acc + count, 0)
+
+    if (total === 0) {
+      return <BarContainer width={width} height={height}>{noDataMessage}</BarContainer>
+    }
+
+    const dataWithPercents = data.map(d => ({ ...d, percent: (100 * (d.count || 0)) / total }))
+    let currCategory = null
+    const popupData = dataWithPercents.reduce((acc, d) => {
+      if (d.count <= 0 && !showAllPopupCategories) {
+        return acc
+      }
+      if (d.category !== currCategory) {
+        currCategory = d.category
+        if (d.category) {
+          acc.push({ name: d.category, header: true })
+        }
+      }
+      acc.push(d)
+      return acc
+    }, [])
+
+    return (
+      <BarContainer width={width} height={height}>
+        <Popup
+          trigger={
+            <NoWrap>
+              {dataWithPercents.filter(d => d.percent >= minPercent).map(
+                d => <BarSection key={d.name} to={(sectionLinks && linkPath) ? `${linkPath}/${d.name}` : linkPath} color={d.color} percent={d.percent} />,
+              )}
+            </NoWrap>
+          }
+          content={
+            <div>
+              {title && (
+                <div>
+                  <b>{title}</b>
+                  <br />
+                </div>
+              )}
+              <NoBorderTable basic="very" compact="very">
+                <Table.Body>
+                  {
+                    popupData.map(d => (
+                      <TableRow key={d.name} verticalAlign="top">
+                        {!d.header && (
+                          <TableCell collapsing textAlign="right">
+                            {d.count}
+                            <ColoredIcon name="square" size="small" color={d.color} />
+                          </TableCell>
+                        )}
+                        <TableCell singleLine colSpan={d.header ? 3 : 1} disabled={Boolean(d.header)}>
+                          {d.name}
+                        </TableCell>
+                        {!d.header && <TableCell collapsing>{showPercent && `(${d.percent.toFixed(0)}%)`}</TableCell>}
+                      </TableRow>
+                    ))
+                  }
+                  {showTotal && (
+                    <TableRow>
+                      <TableCell textAlign="right"><b>{total}</b></TableCell>
+                      <TableCell><b>Total</b></TableCell>
+                      <TableCell />
+                    </TableRow>
+                  )}
+                </Table.Body>
+              </NoBorderTable>
+            </div>
+          }
+          position="bottom center"
+          size="small"
+          hoverable
+          flowing
+        />
+      </BarContainer>
+    )
+  }
+
+}
+
+export default HorizontalStackedBar
