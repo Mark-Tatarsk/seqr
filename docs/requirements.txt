@@ -1,3 +1,4 @@
+# Trigger rebuild
 sphinx>=7.0
 sphinx-rtd-theme
 django>=4.2
