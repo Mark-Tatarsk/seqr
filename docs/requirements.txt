@@ -9,7 +9,7 @@ django-storages
 jsonfield
 social-auth-app-django
 social-auth-core
-anymail
+django-anymail
 elasticsearch
 elasticsearch-dsl
 gunicorn
