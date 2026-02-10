@@ -5,6 +5,10 @@ Welcome to seqr's documentation!
    :maxdepth: 2
    :caption: Contents:
 
+   intro
+   usage
+   api
+
 Indices and tables
 ==================
 

@@ -1,0 +1,17 @@
+# Build artifacts
+docs/_build/
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local settings
+django_key
+.env
+
+# UI artifacts
+ui/dist/
+node_modules/
