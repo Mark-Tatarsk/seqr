@@ -1,6 +1,6 @@
 import os
 import sys
-import django
+from unittest.mock import MagicMock
 
 # -- Path setup --------------------------------------------------------------
 # If extensions (or modules to document with autodoc) are in another directory,
@@ -8,7 +8,24 @@ import django
 # documentation root, use os.path.abspath to make it absolute, like shown here.
 sys.path.insert(0, os.path.abspath('..'))
 
+# -- Mocking modules for Read the Docs ---------------------------------------
+# settings.py imports modules that are not available on RTD. 
+# We mock them here BEFORE django.setup() is called.
+class Mock(MagicMock):
+    @classmethod
+    def __getattr__(cls, name):
+        return MagicMock()
+
+MOCK_MODULES = [
+    'google', 'google.auth', 'google.auth.transport', 'google.auth.transport.requests',
+    'hail', 'elasticsearch', 'elasticsearch_dsl', 'social_django', 'social_core',
+    'psycopg', 'clickhouse_driver', 'redis', 'corsheaders', 'hijack'
+]
+for mod_name in MOCK_MODULES:
+    sys.modules[mod_name] = Mock()
+
 # -- Django setup ------------------------------------------------------------
+import django
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'settings')
 django.setup()
 
@@ -37,20 +54,8 @@ html_theme = 'sphinx_rtd_theme'
 html_static_path = ['_static']
 
 # -- Autodoc configuration ---------------------------------------------------
-# Mocking heavy dependencies that might not be available on RTD
-autodoc_mock_imports = [
-    'hail',
-    'elasticsearch',
-    'elasticsearch_dsl',
-    'google',
-    'google.auth',
-    'social_django',
-    'social_core',
-    'anymail',
-    'psycopg',
-    'clickhouse_driver',
-    'redis',
-]
+# This allows autodoc to skip actually importing the mocked modules during documentation generation
+autodoc_mock_imports = MOCK_MODULES
 
 # -- Napoleon settings -------------------------------------------------------
 napoleon_google_docstring = True
