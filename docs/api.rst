@@ -1,53 +1,25 @@
 API Reference
 =============
 
-This page provides automatic documentation for the Python modules in the seqr project.
+This section contains automatic documentation for the seqr project modules, generated using Sphinx autodoc.
 
-.. autosummary::
-   :toctree: generated
+.. toctree::
+   :maxdepth: 2
+   :caption: Core Modules:
 
-   seqr
-   clickhouse_search
-   matchmaker
-   panelapp
-   reference_data
+   generated/seqr
+   generated/clickhouse_search
+   generated/matchmaker
+   generated/panelapp
+   generated/reference_data
+   generated/admin
 
-Core Module
------------
-
-.. automodule:: seqr
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-Search Module
+Other Modules
 -------------
 
-.. automodule:: clickhouse_search
-   :members:
-   :undoc-members:
-   :show-inheritance:
+.. toctree::
+   :maxdepth: 2
 
-Matchmaker Module
------------------
-
-.. automodule:: matchmaker
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-PanelApp Module
----------------
-
-.. automodule:: panelapp
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-Reference Data Module
----------------------
-
-.. automodule:: reference_data
-   :members:
-   :undoc-members:
-   :show-inheritance:
+   generated/settings
+   generated/wsgi
+   generated/manage
